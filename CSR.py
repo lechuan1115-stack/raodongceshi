@@ -25,6 +25,8 @@ import matplotlib.pyplot as plt
 import mydata_read                     # ← 用你的严格读取函数
 import mymodel1                        # ← 只保留 PerturbAwareNet
 
+PERTURB_ORDER = getattr(mymodel1, "PERTURB_ORDER", ['CFO', 'SCALE', 'GAIN', 'SHIFT', 'CHIRP'])
+
 
 # ============= 数据集封装（简单、确定） =============
 class NumpySignalDataset(Dataset):
@@ -200,12 +202,15 @@ def _forward_eval(model, batch, device, cfg):
     x, y, z, s = batch
     x = x.to(device, non_blocking=True)
     y = y.to(device)
+    z = z.to(device)
+    s = s.to(device)
     if cfg.use_gt_zs_eval:
-        z_use, s_use = z.to(device), s.to(device)
+        z_use, s_use = z, s
     else:
         z_use, s_use = infer_zs(model, x, cfg.z_thresh)
-    logits, feat, _, _ = model(x, z_use, s_use)
-    return logits, feat, y
+    logits, feat, z_logit, s_pred = model(x, z_use, s_use)
+    z_prob = torch.sigmoid(z_logit)
+    return logits, feat, y, z_prob, z, s_pred, s
 
 
 @torch.no_grad()
@@ -214,7 +219,7 @@ def evaluate(model, loader, device, cfg):
     ce = nn.CrossEntropyLoss()
     losses = AverageMeter(); correct = 0; total = 0
     for batch in loader:
-        logits, feat, y = _forward_eval(model, batch, device, cfg)
+        logits, feat, y, _, _, _, _ = _forward_eval(model, batch, device, cfg)
         loss = ce(logits, y)
         losses.update(loss.item(), y.size(0))
         pred = logits.argmax(1)
@@ -227,7 +232,7 @@ def test_and_visualize(model, loader, device, cfg, save_dir, class_names=None):
     model.eval()
     y_true, y_pred = [], []
     for batch in loader:
-        logits, feat, y = _forward_eval(model, batch, device, cfg)
+        logits, feat, y, _, _, _, _ = _forward_eval(model, batch, device, cfg)
         y_true.append(y.cpu().numpy())
         y_pred.append(logits.argmax(1).cpu().numpy())
     y_true = np.concatenate(y_true); y_pred = np.concatenate(y_pred)
@@ -260,6 +265,148 @@ def test_and_visualize(model, loader, device, cfg, save_dir, class_names=None):
             f.write(report or '')
 
     return dict(top1=top1)
+
+
+@torch.no_grad()
+def evaluate_perturbations(model, loader, device, cfg, save_dir, tag="val"):
+    model.eval()
+    if loader is None:
+        return None
+
+    z_true_list, z_prob_list, s_true_list, s_pred_list = [], [], [], []
+    for batch in loader:
+        _, _, _, z_prob, z_true, s_pred, s_true = _forward_eval(model, batch, device, cfg)
+        z_true_list.append(z_true.cpu())
+        z_prob_list.append(z_prob.cpu())
+        s_true_list.append(s_true.cpu())
+        s_pred_list.append(s_pred.cpu())
+
+    if not z_true_list:
+        return None
+
+    z_true = torch.cat(z_true_list, dim=0).numpy()
+    z_prob = torch.cat(z_prob_list, dim=0).numpy()
+    s_true = torch.cat(s_true_list, dim=0).numpy()
+    s_pred = torch.cat(s_pred_list, dim=0).numpy()
+
+    z_pred = (z_prob >= float(cfg.z_thresh)).astype(np.float32)
+
+    def _binary_metrics(gt, pr):
+        gt = gt.astype(np.int32)
+        pr = pr.astype(np.int32)
+        tp = np.logical_and(gt == 1, pr == 1).sum()
+        tn = np.logical_and(gt == 0, pr == 0).sum()
+        fp = np.logical_and(gt == 0, pr == 1).sum()
+        fn = np.logical_and(gt == 1, pr == 0).sum()
+        total = gt.size
+        acc = (tp + tn) / total if total > 0 else 0.0
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+        return acc, prec, rec, f1, tp, fp, fn
+
+    def _reg_metrics(gt, pr, mask):
+        if mask.sum() == 0:
+            return None, None
+        diff = pr[mask] - gt[mask]
+        mae = float(np.mean(np.abs(diff)))
+        rmse = float(np.sqrt(np.mean(diff ** 2)))
+        return mae, rmse
+
+    per_metrics = {}
+    for idx, name in enumerate(PERTURB_ORDER):
+        gt_i = z_true[:, idx]
+        pr_i = z_pred[:, idx]
+        acc, prec, rec, f1, tp, fp, fn = _binary_metrics(gt_i, pr_i)
+        mask = np.logical_and(gt_i == 1, ~np.isnan(s_true[:, idx]))
+        mae, rmse = _reg_metrics(s_true[:, idx], s_pred[:, idx], mask)
+        per_metrics[name] = dict(
+            accuracy=float(acc),
+            precision=float(prec),
+            recall=float(rec),
+            f1=float(f1),
+            support=int(gt_i.sum()),
+            false_positive=int(fp),
+            false_negative=int(fn),
+            mae=None if mae is None else float(mae),
+            rmse=None if rmse is None else float(rmse),
+        )
+
+    acc_flat, prec_flat, rec_flat, f1_flat, _, _, _ = _binary_metrics(z_true.reshape(-1), z_pred.reshape(-1))
+    overall_mae, overall_rmse = _reg_metrics(s_true.reshape(-1), s_pred.reshape(-1),
+                                            np.logical_and(z_true.reshape(-1) == 1, ~np.isnan(s_true.reshape(-1))))
+
+    metrics = dict(
+        per_perturb=per_metrics,
+        overall=dict(
+            accuracy=float(acc_flat),
+            precision=float(prec_flat),
+            recall=float(rec_flat),
+            f1=float(f1_flat),
+            mae=None if overall_mae is None else float(overall_mae),
+            rmse=None if overall_rmse is None else float(overall_rmse),
+        )
+    )
+
+    plot_path = osp.join(save_dir, f"perturb_metrics_{tag}.png")
+    _plot_perturb_metrics(metrics, plot_path)
+
+    json_path = osp.join(save_dir, f"perturb_metrics_{tag}.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=False, indent=2)
+
+    overall = metrics["overall"]
+    print(f"[Perturb-{tag}] accuracy={overall['accuracy']*100:.2f}% precision={overall['precision']*100:.2f}% "
+          f"recall={overall['recall']*100:.2f}% f1={overall['f1']*100:.2f}%")
+    if overall["mae"] is not None:
+        print(f"[Perturb-{tag}] s-MAE={overall['mae']:.4f}  s-RMSE={overall['rmse']:.4f}")
+    else:
+        print(f"[Perturb-{tag}] 无可用的 s 误差统计（无正样本）")
+
+    return metrics
+
+
+def _plot_perturb_metrics(metrics, out_path):
+    per = metrics.get("per_perturb", {})
+    if not per:
+        return
+    names = list(per.keys())
+    acc = np.array([per[n]["accuracy"] for n in names], dtype=np.float32)
+    prec = np.array([per[n]["precision"] for n in names], dtype=np.float32)
+    rec = np.array([per[n]["recall"] for n in names], dtype=np.float32)
+    f1 = np.array([per[n]["f1"] for n in names], dtype=np.float32)
+    mae = np.array([per[n]["mae"] if per[n]["mae"] is not None else np.nan for n in names], dtype=np.float32)
+    rmse = np.array([per[n]["rmse"] if per[n]["rmse"] is not None else np.nan for n in names], dtype=np.float32)
+
+    x = np.arange(len(names))
+    width = 0.2
+
+    fig, axes = plt.subplots(2, 1, figsize=(9, 8), sharex=True)
+
+    ax = axes[0]
+    ax.bar(x - 1.5 * width, acc, width, label='Accuracy')
+    ax.bar(x - 0.5 * width, prec, width, label='Precision')
+    ax.bar(x + 0.5 * width, rec, width, label='Recall')
+    ax.bar(x + 1.5 * width, f1, width, label='F1-score')
+    ax.set_ylabel('Score')
+    ax.set_ylim(0, 1.05)
+    ax.set_title('Perturbation Classification Metrics')
+    ax.grid(True, linestyle='--', alpha=0.3)
+    ax.legend()
+
+    ax = axes[1]
+    ax.bar(x - 0.35, mae, 0.3, label='MAE')
+    ax.bar(x + 0.35, rmse, 0.3, label='RMSE')
+    ax.set_ylabel('Error')
+    ax.set_title('Perturbation Parameter Regression Errors')
+    ax.grid(True, linestyle='--', alpha=0.3)
+    ax.legend()
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=20)
+
+    fig.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.close(fig)
 
 
 def plot_curves(histories, out_path):
@@ -357,20 +504,45 @@ def run(cfg, device):
     model.load_state_dict(torch.load(ckpt, map_location=device))
     acc_val, _ = evaluate(model, valloader, device, cfg)
     test_stats = test_and_visualize(model, testloader, device, cfg, save_dir=cfg.save_root)
+    val_perturb = evaluate_perturbations(model, valloader, device, cfg, save_dir=cfg.save_root, tag="val")
+    test_perturb = evaluate_perturbations(model, testloader, device, cfg, save_dir=cfg.save_root, tag="test")
 
     # 曲线
     plot_curves(history, osp.join(cfg.save_root, "train_val_curves.png"))
 
     # 写 CSV/JSON
-    metrics = dict(val_acc=float(acc_val), test_top1=float(test_stats['top1']), train_time_sec=float(elapsed))
+    metrics = dict(
+        val_acc=float(acc_val),
+        test_top1=float(test_stats['top1']),
+        val_perturb_acc=float(val_perturb['overall']['accuracy'] * 100.0) if val_perturb else None,
+        test_perturb_acc=float(test_perturb['overall']['accuracy'] * 100.0) if test_perturb else None,
+        test_perturb_mae=None if (not test_perturb or test_perturb['overall']['mae'] is None)
+        else float(test_perturb['overall']['mae']),
+        test_perturb_rmse=None if (not test_perturb or test_perturb['overall']['rmse'] is None)
+        else float(test_perturb['overall']['rmse']),
+        train_time_sec=float(elapsed)
+    )
     csv_path = osp.join(cfg.save_root, "summary.csv")
     write_header = (not osp.exists(csv_path))
     with open(csv_path, "a", newline='', encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["val_acc", "test_top1", "train_time_sec", "timestamp"])
+        w = csv.DictWriter(
+            f,
+            fieldnames=[
+                "val_acc", "test_top1", "val_perturb_acc", "test_perturb_acc",
+                "test_perturb_mae", "test_perturb_rmse", "train_time_sec", "timestamp"
+            ]
+        )
         if write_header: w.writeheader()
         w.writerow({**metrics, "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
     with open(osp.join(cfg.save_root, "summary.json"), "w", encoding="utf-8") as f:
-        json.dump({"metrics": metrics, "history": history}, f, ensure_ascii=False, indent=2)
+        json.dump({
+            "metrics": metrics,
+            "history": history,
+            "perturb": {
+                "val": val_perturb,
+                "test": test_perturb,
+            }
+        }, f, ensure_ascii=False, indent=2)
 
     print(f"Val_Acc: {metrics['val_acc']:.2f}%  TestTop1: {metrics['test_top1']:.2f}%")
     print("[DONE] 结果已写入：", cfg.save_root)
