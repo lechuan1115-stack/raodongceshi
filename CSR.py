@@ -351,9 +351,21 @@ def evaluate_perturbations(model, loader, device, cfg, save_dir, tag="val"):
     plot_path = osp.join(save_dir, f"perturb_metrics_{tag}.png")
     _plot_perturb_metrics(metrics, plot_path)
 
+    csv_path = osp.join(save_dir, "perturb_metrics.csv")
+    _export_perturb_metrics_csv(metrics, csv_path, tag)
+
     json_path = osp.join(save_dir, f"perturb_metrics_{tag}.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
+
+    for name, m in per_metrics.items():
+        mae_str = "None" if m["mae"] is None else f"{m['mae']:.4f}"
+        rmse_str = "None" if m["rmse"] is None else f"{m['rmse']:.4f}"
+        print(
+            f"[Perturb-{tag}:{name}] acc={m['accuracy']*100:.2f}% prec={m['precision']*100:.2f}% "
+            f"rec={m['recall']*100:.2f}% f1={m['f1']*100:.2f}% "
+            f"MAE={mae_str} RMSE={rmse_str}"
+        )
 
     overall = metrics["overall"]
     print(f"[Perturb-{tag}] accuracy={overall['accuracy']*100:.2f}% precision={overall['precision']*100:.2f}% "
@@ -407,6 +419,46 @@ def _plot_perturb_metrics(metrics, out_path):
     fig.tight_layout()
     plt.savefig(out_path, dpi=200)
     plt.close(fig)
+
+
+def _export_perturb_metrics_csv(metrics, csv_path, tag):
+    per = metrics.get("per_perturb", {})
+    if not per:
+        return
+
+    fieldnames = [
+        "dataset",
+        "perturb",
+        "accuracy",
+        "precision",
+        "recall",
+        "f1",
+        "support",
+        "false_positive",
+        "false_negative",
+        "mae",
+        "rmse",
+    ]
+
+    write_header = not osp.exists(csv_path)
+    with open(csv_path, "a", newline='', encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        for name, m in per.items():
+            writer.writerow({
+                "dataset": tag,
+                "perturb": name,
+                "accuracy": f"{m['accuracy']*100:.4f}",
+                "precision": f"{m['precision']*100:.4f}",
+                "recall": f"{m['recall']*100:.4f}",
+                "f1": f"{m['f1']*100:.4f}",
+                "support": m["support"],
+                "false_positive": m["false_positive"],
+                "false_negative": m["false_negative"],
+                "mae": "" if m["mae"] is None else f"{m['mae']:.6f}",
+                "rmse": "" if m["rmse"] is None else f"{m['rmse']:.6f}",
+            })
 
 
 def plot_curves(histories, out_path):
